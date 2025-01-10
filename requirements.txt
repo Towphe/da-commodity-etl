@@ -1,0 +1,8 @@
+pandas
+psycopg
+selenium
+datetime
+time
+os
+pdfplumber
+python-dotenv
