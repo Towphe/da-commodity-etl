@@ -1,8 +1,5 @@
 pandas
-psycopg
+psycopg[binary]
 selenium
-datetime
-time
-os
 pdfplumber
 python-dotenv

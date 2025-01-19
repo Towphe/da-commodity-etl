@@ -9,12 +9,26 @@ import time
 import os
 import pdfplumber
 from dotenv import load_dotenv
+import threading
+import re
+
+# DEV NOTE
+# only files past September 1, 2021 are parseable by the current version.
+# Possible fix: create separate parser for earlier files with different format.
 
 # load environment variables
 load_dotenv()
 
-# check documentation for valid url patterns
-db_key = os.getenv("DB_KEY")
+# ======= Shared Variables ========
+db_key = os.getenv("DB_KEY") # check documentation for valid url patterns
+download_path = os.getcwd() + "/temp"
+options = Options()
+options.add_experimental_option("prefs", {
+    "download.default_directory": download_path
+})
+options.add_experimental_option("excludeSwitches", ["disable-popup-blocking"])
+source = "https://www.da.gov.ph/price-monitoring/"
+# =================================
 
 if db_key == "" or db_key == None:
     raise Exception("No `DB_KEY` defined in environment variables.")
@@ -25,6 +39,9 @@ db = psycopg.connect(db_key, cursor_factory=psycopg.ClientCursor)
 # treats values of price
 def treat_price(val):
     # split string price bh ` - `
+    if val == None:
+        return []
+
     splitted_val = val.split("-")
 
     # validate cells lacking data
@@ -43,7 +60,41 @@ def treat_price(val):
     # return array
     return splitted_val
 
+# fix row errors after extraction from pdf
+def treat_row(row:list):
+    i = 0
+    for i in range(len(row)):
+        # iterate through each value of the row
+
+        # skip first and None values
+        if i == 0 or row[i] == None:
+            i += 1
+            continue
+        
+        # mark index for disregard when blank
+        if row[i] == "":
+            i += 1
+            continue
+        
+        res = re.search("^[0-9][0-9]*.[0-9][0-9]$", row[i])
+
+        # check if value is single number[
+        if re.search("^[0-9][0-9]*.[0-9][0-9]$", row[i]) != None:
+            # fix cell if succeeding is a dash (-)
+            if i < len(row) - 2 and row[i+1] == "-":
+                row[i] = f"{row[i]}-{row[i+2]}"
+                # set skipped rows to blank
+                row[i+1] = None
+                row[i+2] = None
+
+                i += 2 # skip 2 indices
+        if (type(row[i]) == str):
+            row[i] = row[i].replace(" ", "")
+
+    return row
+
 # retrieve commodities from DB
+# DEPRECATED
 def retrieve_commodities() -> pd.DataFrame:
     # retrieve from sql and format to dataframe
     commodities = pd.read_sql("SELECT * FROM commodity", con = db)
@@ -51,6 +102,7 @@ def retrieve_commodities() -> pd.DataFrame:
     return commodities
 
 # retrieves markets from DB
+# DEPRECATED
 def retrieve_markets() -> pd.DataFrame:
     # retrieve from sql and format to dataframe
     commodities = pd.read_sql("SELECT * FROM market", con = db)
@@ -161,19 +213,28 @@ def treat_date(string_date:str) -> str|None:
 def retrieve_latest_file() -> str | None:
     # define source link
     source = "https://www.da.gov.ph/price-monitoring/"
-    download_path = "/home/tope/Documents/Programming Files (v2)/Projects/crop-price-etl/temp"
-
-    #
-    options = Options()
-    options.add_experimental_option("prefs", {
-        "download.default_directory": download_path
-    })
 
     # initialize session (use Chrome)
     driver = webdriver.Chrome(options=options)
 
     # navigate to source page
     driver.get(source)
+
+    # wait for site to load
+    time.sleep(3)
+
+    # get exit button of popup
+    try:
+        exit_popup_button = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[10]/div[2]/div/div/div/button")
+
+        if (exit_popup_button != None):
+            # click the button
+            exit_popup_button.click()
+
+            time.sleep(3)
+    except:
+        print()
+    
 
     # retrieve firstmost report that contains daily reports
     report = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[5]/div/div/div[1]/article/div[2]/table/tbody/tr[1]/td[1]/a")
@@ -190,60 +251,59 @@ def retrieve_latest_file() -> str | None:
     return report.text
 
 # function that extracts prices from DA file as a pandas DataFrame
-def extract_prices(filename: str) -> pd.DataFrame:
+def extract_prices(filename: str):
 
     with pdfplumber.open(filename) as pdf:
-        if (len(pdf.pages) == 2):
-            tables = pdf.pages[1].extract_table()
+        if (len(pdf.pages) >= 2):
+            # extract table
+            table = pdf.pages[1].extract_table()
 
-            print(tables)
+            i = 0
+            for i in range(len(table)):
+                # treat each row
+                table[i] = treat_row(table[i])
 
-            market_prices = pd.DataFrame(tables)
+            # parse list of rows to DataFrame
+            market_prices = pd.DataFrame(table)
+
+            columns = list(filter(lambda val: val != None, table[1]))
+            # print(columns)
 
             # ==== TRANSFORM =====
+            # remove empty header row
             market_prices = market_prices.iloc[range(2,market_prices.shape[0]),range(market_prices.shape[1])]
+
+            # drop columns with `None` headers
+            market_prices.dropna(axis=1, how="all", inplace=True)
+
+            # reset indices
+            market_prices.columns = range(market_prices.columns.size)   
+
             # iterate through columns
             for i in range(market_prices.shape[1]):
                 if i == 0:
-                    # skip name
                     continue
-
-                # treat numerical values
+                
                 market_prices[i] = market_prices[i].apply(treat_price)
+
+            market_prices.iloc[0] = columns
 
             return market_prices
     return None
 
 # function that loads prices to DB
 def load_prices(market_prices: pd.DataFrame, filename:str) -> None:
-    markets = retrieve_markets()
-    commodities = retrieve_commodities()
+    commodities = market_prices.iloc[0]
     prices = []
-
-    print(market_prices)
 
     # iterate per row
     for i, row in market_prices.iterrows():
-        # check existence of market in db
-        market_id = None
-
-        if (markets[markets["name"] == row[0]].shape[0] == 0):
-            # none found; insert to db (implement later)
-            print(f"None found at row {i}. Skipping...", flush=True)
-            continue
-        else:
-            market_id = i - 1
-
-        # DEV NOTES
-        # It would be much more efficient network-wise
-        # if the market and commodity table is loaded into a dataframe
-        # for the whole duration of the extraction.
-        # iterate through each commodity
-
         j = 0
+        market_name = None
         for price in row:
-            # skip title
+            ## skip title
             if j == 0:
+                market_name = price
                 j += 1
                 continue
 
@@ -251,13 +311,13 @@ def load_prices(market_prices: pd.DataFrame, filename:str) -> None:
             if len(price) == 1:
                 prices.append(
                     (
-                        j+1,market_id,price[0],None,None,True,treat_date(filename)
+                        commodities[j],market_name,price[0],None,None,treat_date(filename)
                     )
                 )
             elif len(price) == 2:
                 prices.append(
                     (
-                        j+1,market_id,None,price[0],price[1],True,treat_date(filename)
+                        commodities[j],market_name,None,price[0],price[1],treat_date(filename)
                     )
                 )
 
@@ -267,9 +327,8 @@ def load_prices(market_prices: pd.DataFrame, filename:str) -> None:
     cur = db.cursor()
 
     # load prices to DB
-    with cur.copy("COPY price (commodity_id, market_id,mean_price,minimum_price,maximum_price,is_available,date) FROM STDIN") as copy:
+    with cur.copy("COPY initial_price (commodity_name, market_name,mean_price,minimum_price,maximum_price,date) FROM STDIN") as copy:
         for price in prices:
-            print(price)
             copy.write_row(price)
 
     db.commit()
@@ -281,14 +340,34 @@ def extract_latest() -> bool:
     # retrieve latest
     filename = retrieve_latest_file()
 
+    # check if file has been extracted
+    commodities = pd.read_sql("SELECT * FROM retrieved_files", con = db)
+    if commodities.empty == False:
+        return False
+    
+    # extract prices
     market_prices = extract_prices(f"./temp/{filename}.pdf")
 
     if type(market_prices) == pd.DataFrame:
         # load to db
         load_prices(market_prices, filename)
         print("Successful extraction.", flush=True)
+
+        # load retrieved file as success
+        db.execute("""
+                    INSERT INTO retrieved_files (date)
+                    VALUES (%s);
+                   """, (treat_date(filename),))
+        db.commit()
     else:
         print("Unsuccessful extraction.")
+
+        # load retrieved file as failed
+        db.execute("""
+                    INSERT INTO retrieved_files (date, is_success)
+                    VALUES (%s);
+                   """, (treat_date(filename), False))
+        db.commit()
         return False
 
     # delete file
@@ -325,7 +404,7 @@ def extract_today() -> bool:
 
     return True
 
-# function that attempts to extract today's prices (3 times)
+# function that attempts to extract latest prices (3 times)
 def run():
     # try 3 times
     for i in range(3):
@@ -346,18 +425,73 @@ def run():
                 print(f"Extraction attempt #{i+1} unsuccessful. Exiting...", flush=True)
             continue
 
-# function that extracts all files
+def extract_portions(start:int, end:int):
+    # initialize new Chrome driver
+    driver = webdriver.Chrome(options=options)
+
+    # navigate to source page
+    driver.get(source)
+
+    # wait for proper load
+    time.sleep(5)
+
+    # hide popup
+    popup = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[10]/div[2]/div/div/div/button")
+
+    time.sleep(3)
+
+    # click exit
+    popup.click()
+
+    # wait till popup is hidden
+    time.sleep(3)
+
+    filename = ""
+
+    for i in range(end):
+        try:
+            # attempt to deal with every file here
+            f = driver.find_element(by=By.XPATH, value=f"/html/body/div[2]/div[5]/div/div/div[1]/article/div[2]/table/tbody/tr[{start+i}]/td[1]/a")
+
+            # save filename
+            filename = f.text
+
+            # add download attribute
+            driver.execute_script(f"arguments[0].setAttribute('download', '{f.text}');", f)
+
+            # click button/link and redirect to PDF download
+            f.click()
+
+            # sleep temporarily
+            time.sleep(2)
+
+            # extract prices from saved file
+            market_prices = extract_prices(f"./temp/{filename}.pdf") # fix
+
+            if type(market_prices) == pd.DataFrame:
+                # load to db
+                load_prices(market_prices, filename)
+                # log_file.write(f"Successful extraction of {filename}.pdf\n")
+                print(f"Successful extraction of {filename}.pdf.", flush=True)
+
+                # delete file
+                os.remove(f"./temp/{filename}.pdf")
+            else:
+                # log_file.write(f"Unsuccessful extraction of {filename}.pdf\n")
+                print(f"Unsuccessful extraction of {filename}.pdf.", flush=True)
+        except Exception as error:
+            # skip row with error, continue extraction
+            # log_file.write(f"Unsuccessful extraction of {filename}.pdf\n")
+            print(f"Unsuccessful extraction of {filename}.pdf", flush=True)
+            print(f"Exception occured: {error}", flush=True)
+            continue
+
+# function that extracts all files (not yet finished)
 # TODO: implement multi-threadding
 def extract_all():
     # define source link
-    source = "https://www.da.gov.ph/price-monitoring/"
-    download_path = "/home/tope/Documents/Programming Files (v2)/Projects/crop-price-etl/temp"
-
-    options = Options()
-    options.add_experimental_option("prefs", {
-        "download.default_directory": download_path
-    })
-    options.add_experimental_option("excludeSwitches", ["disable-popup-blocking"])
+    # source = "https://www.da.gov.ph/price-monitoring/"
+    # download_path = "/home/tope/Documents/Programming Files (v2)/Projects/crop-price-etl/temp"
 
     # initialize session (use Chrome)
     driver = webdriver.Chrome(options=options)
@@ -370,10 +504,13 @@ def extract_all():
 
     # hide popup
     popup = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[10]/div[2]/div/div/div/button")
+
+    time.sleep(3)
+
     popup.click()
 
     # wait till popup is hidden
-    time.sleep(5)
+    time.sleep(3)
 
     # retrieve table containing files
     report_container = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[5]/div/div/div[1]/article/div[2]/table/tbody")
@@ -406,8 +543,8 @@ def extract_all():
             # sleep temporarily
             time.sleep(2)
 
-            # extract prices from saved file
-            market_prices = extract_prices(f"./temp/{filename}.pdf")
+            # extract prices from saved file 
+            market_prices = extract_prices(f"./temp/{filename}.pdf") # FIX
 
             if type(market_prices) == pd.DataFrame:
                 # load to db
@@ -421,8 +558,6 @@ def extract_all():
                 log_file.write(f"Unsuccessful extraction of {filename}.pdf\n")
                 print(f"Unsuccessful extraction of {filename}.pdf.", flush=True)
                 return False
-
-
         except Exception as error:
             # skip row with error, continue extraction
             log_file.write(f"Unsuccessful extraction of {filename}.pdf\n")
@@ -430,44 +565,64 @@ def extract_all():
             print(f"Exception occured: {error}", flush=True)
             continue
 
-    # for report in range(total):
-        # print(reports[i].text, flush=True)
-
-        # time.sleep(1)
-
-        # if reports[i].text == "":
-        #     break
-
-
-
-    #     WebDriverWait(driver, 5)
-
-    # print(reports, flush=True)
-    # first 20
-    #
-    # print(reports[500], flush=True)
-    # # f = r.find_element(by=By.TAG_NAME, value=f"a")
-
-    # WebDriverWait(driver, 2)
-    # print(file.text, flush=True)
-    # for r in reports:
-    #     print(r.text)
-    #     filenames.append(r.text)
-    #     i+=1
-
-
-    # print(filenames, flush=True)
     print("End of extraction", flush=True)
-    # add download attribute
-    # driver.execute_script(f"arguments[0].setAttribute('download', '{report.text}');", report)
 
-    # click button/link and redirect to PDF download
-    # report.click()
-
-    # # sleep temporarily
-    # time.sleep(2)
-
-    # return report.text
     return
 
-run()
+# multi-threadded version of extract_all
+def extract_all_multithread():
+    # define source link
+    # source = "https://www.da.gov.ph/price-monitoring/"
+    # download_path = "/home/tope/Documents/Programming Files (v2)/Projects/crop-price-etl/temp"
+
+    # initialize session (use Chrome)
+    driver = webdriver.Chrome(options=options)
+
+    # navigate to source page
+    driver.get(source)
+
+    # wait for proper load
+    time.sleep(5)
+
+    # hide popup
+    popup = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[10]/div[2]/div/div/div/button")
+
+    time.sleep(3)
+
+    popup.click()
+
+    # wait till popup is hidden
+    time.sleep(3)
+
+    # retrieve table containing files
+    report_container = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[5]/div/div/div[1]/article/div[2]/table/tbody")
+
+    # retrieve reports
+    reports = report_container.find_elements(by=By.TAG_NAME, value="tr")
+
+    # get total count of reports
+    total = len(reports)
+    print(f"Found a total of {total} elements", flush=True)
+
+    log_file = open("log.txt", "w")
+
+    filename = ""
+
+    driver.close()
+
+    # print(reports[0:(int(total/2))], flush=True)
+
+    # create threads
+    t1 = threading.Thread(target=extract_portions, args=(1, int(total/2),))
+    t2 = threading.Thread(target=extract_portions, args=(int(total/2)+1,total,))
+
+    t1.start()
+    t2.start()
+
+    t1.join()
+    t2.join()
+
+    return
+
+# extracts latest file
+extract_latest()

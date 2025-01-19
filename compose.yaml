@@ -1,0 +1,47 @@
+version: "3.9"
+
+networks:
+  db-bridge:
+    driver: bridge
+    external: true
+services:
+  db:
+    image: postgres:17.2
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      POSTGRES_USER: $DB_USERNAME
+      POSTGRES_PASSWORD: $DB_PASSWORD
+      POSTGRES_DB: "commodity_db"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "pg_isready",
+          "-h",
+          "localhost",
+          "-U",
+          "tope",
+          "-p",
+          "5440",
+          "-d",
+          "commodity_db",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5440:5440"
+    networks:
+      - db-bridge
+    expose:
+      - "5440"
+    command: -p 5440
+  da:
+    build: .
+    networks:
+      - db-bridge
+    depends_on:
+      db:
+        condition: service_healthy
