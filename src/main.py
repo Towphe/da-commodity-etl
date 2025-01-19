@@ -343,6 +343,7 @@ def extract_latest() -> bool:
     # check if file has been extracted
     commodities = pd.read_sql("SELECT * FROM retrieved_files", con = db)
     if commodities.empty == False:
+        print(f"{filename}.pdf has been retrieved before.")
         return False
     
     # extract prices
