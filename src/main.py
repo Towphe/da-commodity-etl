@@ -13,7 +13,7 @@ import threading
 import re
 
 # DEV NOTE
-# only files past September 1, 2021 are parseable by the current version.
+# only files past December 15, 2022 are parseable by the current version.
 # Possible fix: create separate parser for earlier files with different format.
 
 # load environment variables
@@ -22,11 +22,14 @@ load_dotenv()
 # ======= Shared Variables ========
 db_key = os.getenv("DB_KEY") # check documentation for valid url patterns
 download_path = os.getcwd() + "/temp"
-options = Options()
+# print(download_path)
+options = webdriver.ChromeOptions()
 options.add_experimental_option("prefs", {
     "download.default_directory": download_path
 })
-options.add_experimental_option("excludeSwitches", ["disable-popup-blocking"])
+# options.add_argument("--user-data-dir=/home/tope/.var/app/com.google.Chrome/config/google-chrome")
+# options.add_argument("--profile-directory=Default")
+# options.add_experimental_option("excludeSwitches", ["disable-popup-blocking"])
 source = "https://www.da.gov.ph/price-monitoring/"
 # =================================
 
@@ -34,7 +37,7 @@ if db_key == "" or db_key == None:
     raise Exception("No `DB_KEY` defined in environment variables.")
 
 # db connection
-db = psycopg.connect(db_key, cursor_factory=psycopg.ClientCursor)
+# db = psycopg.connect(db_key, cursor_factory=psycopg.ClientCursor)
 
 # treats values of price
 def treat_price(val):
@@ -215,6 +218,7 @@ def retrieve_latest_file() -> str | None:
     source = "https://www.da.gov.ph/price-monitoring/"
 
     # initialize session (use Chrome)
+    # driver = webdriver.Chrome(options=options)
     driver = webdriver.Chrome(options=options)
 
     # navigate to source page
@@ -248,7 +252,11 @@ def retrieve_latest_file() -> str | None:
     # sleep temporarily
     time.sleep(2)
 
-    return report.text
+    report_name = report.text
+
+    driver.close()
+
+    return report_name
 
 # function that extracts prices from DA file as a pandas DataFrame
 def extract_prices(filename: str):
@@ -292,7 +300,7 @@ def extract_prices(filename: str):
     return None
 
 # function that loads prices to DB
-def load_prices(market_prices: pd.DataFrame, filename:str) -> None:
+def load_prices(market_prices: pd.DataFrame, filename:str, db) -> None:
     commodities = market_prices.iloc[0]
     prices = []
 
@@ -304,6 +312,15 @@ def load_prices(market_prices: pd.DataFrame, filename:str) -> None:
             ## skip title
             if j == 0:
                 market_name = price
+                j += 1
+                continue
+                
+            if price == None:
+                prices.append(
+                    (
+                        commodities[j],market_name,None,None,None,treat_date(filename)
+                    )
+                )
                 j += 1
                 continue
 
@@ -339,6 +356,8 @@ def load_prices(market_prices: pd.DataFrame, filename:str) -> None:
 def extract_latest() -> bool:
     # retrieve latest
     filename = retrieve_latest_file()
+    
+    db = psycopg.connect(db_key, cursor_factory=psycopg.ClientCursor)
 
     # check if file has been extracted
     commodities = pd.read_sql("SELECT * FROM retrieved_files", con = db)
@@ -351,7 +370,7 @@ def extract_latest() -> bool:
 
     if type(market_prices) == pd.DataFrame:
         # load to db
-        load_prices(market_prices, filename)
+        load_prices(market_prices, filename, db)
         print("Successful extraction.", flush=True)
 
         # load retrieved file as success
@@ -372,7 +391,9 @@ def extract_latest() -> bool:
         return False
 
     # delete file
-    os.remove(f"./temp/{filename}.pdf")
+    os.remove(f"{download_path}/{filename}.pdf")
+
+    
 
     db.close()
 
@@ -382,6 +403,8 @@ def extract_latest() -> bool:
 def extract_today() -> bool:
     # retrieve latest
     filename = retrieve_latest_file()
+
+    db = psycopg.connect(db_key, cursor_factory=psycopg.ClientCursor)
 
     if filename == None:
         return False
@@ -395,7 +418,7 @@ def extract_today() -> bool:
 
     if type(market_prices) == pd.DataFrame:
         # load to db
-        load_prices(market_prices, filename)
+        load_prices(market_prices, filename, db)
         print("Successful extraction.", flush=True)
     else:
         print("Unsuccessful extraction.", flush=True)
@@ -419,16 +442,39 @@ def run():
                 continue
             else:
                 return
-        except:
+        except Exception as e:
             if (i < 2):
                 print(f"Extraction attempt #{i+1} unsuccessful. Trying again.", flush=True)
             else:
                 print(f"Extraction attempt #{i+1} unsuccessful. Exiting...", flush=True)
+            print(f"Error:\n{e}")
             continue
 
-def extract_portions(start:int, end:int):
+def load_file_record(filename, db, success=True) -> None:
+
+    is_valid_filename = True
+
+    try:
+        if type(filename) != str:
+            is_valid_filename = False
+        else:
+            treat_date(filename)
+    except:
+        is_valid_filename = False
+                
+    # load retrieved file along with its status
+    db.execute("""
+                INSERT INTO retrieved_files (date, is_success)
+                VALUES (%s, %s);
+                """, (treat_date(filename), success))            
+    db.commit()
+
+
+def extract_portions(start:int, end:int, db):
     # initialize new Chrome driver
     driver = webdriver.Chrome(options=options)
+
+    # NOTE: CREATE OWN INSTANCE OF DB DRIVER TO AVOID MULTI-THREADING ISSUE
 
     # navigate to source page
     driver.get(source)
@@ -437,15 +483,17 @@ def extract_portions(start:int, end:int):
     time.sleep(5)
 
     # hide popup
-    popup = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[10]/div[2]/div/div/div/button")
+    # get exit button of popup
+    try:
+        exit_popup_button = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[10]/div[2]/div/div/div/button")
 
-    time.sleep(3)
+        if (exit_popup_button != None):
+            # click the button
+            exit_popup_button.click()
 
-    # click exit
-    popup.click()
-
-    # wait till popup is hidden
-    time.sleep(3)
+            time.sleep(3)
+    except:
+        print()
 
     filename = ""
 
@@ -471,24 +519,30 @@ def extract_portions(start:int, end:int):
 
             if type(market_prices) == pd.DataFrame:
                 # load to db
-                load_prices(market_prices, filename)
+                load_prices(market_prices, filename, db)
                 # log_file.write(f"Successful extraction of {filename}.pdf\n")
                 print(f"Successful extraction of {filename}.pdf.", flush=True)
 
                 # delete file
                 os.remove(f"./temp/{filename}.pdf")
+
+                # load retrieved file as success
+                load_file_record(filename, db, True)
             else:
                 # log_file.write(f"Unsuccessful extraction of {filename}.pdf\n")
                 print(f"Unsuccessful extraction of {filename}.pdf.", flush=True)
+                # load retrieved file as failed
+                load_file_record(filename, db, False)
         except Exception as error:
             # skip row with error, continue extraction
-            # log_file.write(f"Unsuccessful extraction of {filename}.pdf\n")
             print(f"Unsuccessful extraction of {filename}.pdf", flush=True)
             print(f"Exception occured: {error}", flush=True)
+
+            # load retrieved file as failed
+            load_file_record(filename, db, False)
             continue
 
-# function that extracts all files (not yet finished)
-# TODO: implement multi-threadding
+# function that extracts all files
 def extract_all():
     # define source link
     # source = "https://www.da.gov.ph/price-monitoring/"
@@ -496,6 +550,8 @@ def extract_all():
 
     # initialize session (use Chrome)
     driver = webdriver.Chrome(options=options)
+
+    db = psycopg.connect(db_key, cursor_factory=psycopg.ClientCursor)
 
     # navigate to source page
     driver.get(source)
@@ -549,7 +605,7 @@ def extract_all():
 
             if type(market_prices) == pd.DataFrame:
                 # load to db
-                load_prices(market_prices, filename)
+                load_prices(market_prices, filename, db)
                 log_file.write(f"Successful extraction of {filename}.pdf\n")
                 print(f"Successful extraction of {filename}.pdf.", flush=True)
 
@@ -572,12 +628,13 @@ def extract_all():
 
 # multi-threadded version of extract_all
 def extract_all_multithread():
-    # define source link
-    # source = "https://www.da.gov.ph/price-monitoring/"
-    # download_path = "/home/tope/Documents/Programming Files (v2)/Projects/crop-price-etl/temp"
+    # last working file
+    last_working_file_name = "December 15, 2022"
 
     # initialize session (use Chrome)
     driver = webdriver.Chrome(options=options)
+
+    db = psycopg.connect(db_key, cursor_factory=psycopg.ClientCursor)
 
     # navigate to source page
     driver.get(source)
@@ -585,15 +642,17 @@ def extract_all_multithread():
     # wait for proper load
     time.sleep(5)
 
-    # hide popup
-    popup = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[10]/div[2]/div/div/div/button")
+    # get exit button of popup then hide if existing
+    try:
+        exit_popup_button = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[10]/div[2]/div/div/div/button")
 
-    time.sleep(3)
+        if (exit_popup_button != None):
+            # click the button
+            exit_popup_button.click()
 
-    popup.click()
-
-    # wait till popup is hidden
-    time.sleep(3)
+            time.sleep(3)
+    except:
+        print()
 
     # retrieve table containing files
     report_container = driver.find_element(by=By.XPATH, value="/html/body/div[2]/div[5]/div/div/div[1]/article/div[2]/table/tbody")
@@ -603,6 +662,15 @@ def extract_all_multithread():
 
     # get total count of reports
     total = len(reports)
+
+    # count how many till reaching guaranteed working file
+    for i in range(total):
+        row = driver.find_element(By.XPATH, value=f"/html/body/div[2]/div[5]/div/div/div[1]/article/div[2]/table/tbody/tr[{i+1}]/td[1]/a")
+        if row.text == last_working_file_name:
+            # set new total
+            total = i+1
+            break
+
     print(f"Found a total of {total} elements", flush=True)
 
     log_file = open("log.txt", "w")
@@ -611,11 +679,9 @@ def extract_all_multithread():
 
     driver.close()
 
-    # print(reports[0:(int(total/2))], flush=True)
-
     # create threads
-    t1 = threading.Thread(target=extract_portions, args=(1, int(total/2),))
-    t2 = threading.Thread(target=extract_portions, args=(int(total/2)+1,total,))
+    t1 = threading.Thread(target=extract_portions, args=(1, int(total/2), db,))
+    t2 = threading.Thread(target=extract_portions, args=(int(total/2)+1,total, db))
 
     t1.start()
     t2.start()
@@ -625,5 +691,4 @@ def extract_all_multithread():
 
     return
 
-# extracts latest file
-extract_latest()
+extract_all_multithread()
